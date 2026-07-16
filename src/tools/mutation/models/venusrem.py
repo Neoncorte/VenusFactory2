@@ -115,13 +115,21 @@ def count_matrix_from_structure_alignment(tokenizer, alignment_dict, device):
     """
     alignment_seqs = list(alignment_dict.values())
     print(f">>> Start tokenizing {len(alignment_seqs)} structure alignment sequences")
-    
+
     if len(alignment_seqs) == 0:
         return None
-    
-    tokenized_results = tokenizer(alignment_seqs, return_tensors="pt", padding=True)
-    alignment_ids = tokenized_results["input_ids"][:, 1:-1]  # Remove [CLS] and [SEP] tokens
-    
+
+    # Map characters straight to vocab ids instead of calling tokenizer(...): EsmTokenizer's
+    # word-level pretokenizer collapses a whole run of consecutive unknown characters (the '-'
+    # gap padding) into a single <unk> token instead of one per character, which silently
+    # shortens the sequence and breaks the per-column alignment this function depends on.
+    vocab = tokenizer.get_vocab()
+    unk_id = vocab[tokenizer.unk_token]
+    alignment_ids = torch.tensor(
+        [[vocab.get(ch, unk_id) for ch in seq] for seq in alignment_seqs],
+        dtype=torch.long,
+    )
+
     # Count distribution of each column, [seq_len, vocab_size]
     count_matrix = torch.zeros(alignment_ids.size(1), tokenizer.vocab_size)
     print(f">>> Counting amino acid distribution at each position")
