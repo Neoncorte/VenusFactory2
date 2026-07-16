@@ -29,8 +29,7 @@ def load_structure(fpath, chain=None):
         biotite.structure.AtomArray
     """
     if fpath.endswith('cif'):
-        with open(fpath) as fin:
-            pdbxf = pdbx.PDBxFile.read(fin)
+        pdbxf = pdbx.CIFFile.read(fpath)
         structure = pdbx.get_structure(pdbxf, model=1)
     elif fpath.endswith('pdb'):
         with open(fpath) as fin:
