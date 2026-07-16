@@ -5,6 +5,7 @@ import warnings
 import pandas as pd
 import torch.nn.functional as F
 from tqdm import tqdm
+from functools import partial
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from torch_scatter import scatter_mean, scatter_sum, scatter_max
@@ -83,6 +84,23 @@ def get_embeds(model, dataloader, device, pooling="mean"):
     return norm_embeds
 
 
+def _collate_subgraph_files(batch):
+    # TODO: speed up
+    batch_graphs = []
+    for d in batch:
+        subgraph_dict = torch.load(d)
+        batch_graphs.extend(list(subgraph_dict.values()))
+
+    # graph has `index_map` or other redundant attributes, remove them
+    prue_batch_graphs = []
+    for d in batch_graphs:
+        prue_batch_graphs.append(convert_graph(d))
+
+    batch_graphs = Batch.from_data_list(prue_batch_graphs)
+    batch_graphs.node_s = torch.zeros_like(batch_graphs.node_s)
+    return batch_graphs
+
+
 def subgraph_conventer(subgraph_dir, pdb_dir, max_batch_nodes, num_processes=12):
     print("---------- Load Subgraphs ----------")
     results, node_counts = [], []
@@ -105,27 +123,11 @@ def subgraph_conventer(subgraph_dir, pdb_dir, max_batch_nodes, num_processes=12)
         node_counts.append(node_count)
     
 
-    def collate_fn(batch):
-        # TODO: speed up
-        batch_graphs = []
-        for d in batch:
-            subgraph_dict = torch.load(d)
-            batch_graphs.extend(list(subgraph_dict.values()))
-
-        # graph has `index_map` or other redundant attributes, remove them
-        prue_batch_graphs = []
-        for d in batch_graphs:
-            prue_batch_graphs.append(convert_graph(d))
-
-        batch_graphs = Batch.from_data_list(prue_batch_graphs)
-        batch_graphs.node_s = torch.zeros_like(batch_graphs.node_s)
-        return batch_graphs
-
     data_loader = DataLoader(
         subgraph_files,
         num_workers=num_processes,
         batch_sampler=BatchSampler(node_counts, max_batch_nodes, shuffle=False),
-        collate_fn=collate_fn,
+        collate_fn=_collate_subgraph_files,
     )
 
     return data_loader, results
@@ -192,26 +194,11 @@ def graph_conventer(
         results.append(result_dict)
         node_counts.append(node_count)
     
-    def collate_fn(batch):
-        batch_graphs = []
-        if cache_subgraph_dir:
-            for d in batch:
-                name = d.split("/")[-1].split(".")[0]
-                graph = torch.load(os.path.join(cache_subgraph_dir, f"{name}.pt"))
-                batch_graphs.extend(graph.values())
-        else:
-            for d in batch:
-                batch_graphs.extend(d)
-
-        batch_graphs = Batch.from_data_list(batch_graphs)
-        batch_graphs.node_s = torch.zeros_like(batch_graphs.node_s)
-        return batch_graphs
-
     data_loader = DataLoader(
         dataset,
         num_workers=num_processes,
         batch_sampler=BatchSampler(node_counts, max_batch_nodes, shuffle=False),
-        collate_fn=collate_fn,
+        collate_fn=partial(_collate_subgraph_batch, cache_subgraph_dir=cache_subgraph_dir),
     )
 
     return data_loader, results
@@ -265,6 +252,22 @@ def process_pdb_file(
     return subgraphs, result_dict, len(anchor_nodes)
 
 
+def _collate_subgraph_batch(batch, cache_subgraph_dir=None):
+    batch_graphs = []
+    if cache_subgraph_dir is not None:
+        for d in batch:
+            name = d.split("/")[-1].split(".")[0]
+            graph = torch.load(os.path.join(cache_subgraph_dir, f"{name}.pt"))
+            batch_graphs.extend(graph.values())
+    else:
+        for d in batch:
+            batch_graphs.extend(d)
+
+    batch_graphs = Batch.from_data_list(batch_graphs)
+    batch_graphs.node_s = torch.zeros_like(batch_graphs.node_s)
+    return batch_graphs
+
+
 def pdb_conventer(
     pdb_files,
     subgraph_depth,
@@ -310,28 +313,13 @@ def pdb_conventer(
             error_file, index=False
         )
 
-    def collate_fn(batch):
-        batch_graphs = []
-        if cache_subgraph_dir is not None:
-            for d in batch:
-                name = d.split("/")[-1].split(".")[0]
-                graph = torch.load(os.path.join(cache_subgraph_dir, f"{name}.pt"))
-                batch_graphs.extend(graph.values())
-        else:
-            for d in batch:
-                batch_graphs.extend(d)
-
-        batch_graphs = Batch.from_data_list(batch_graphs)
-        batch_graphs.node_s = torch.zeros_like(batch_graphs.node_s)
-        return batch_graphs
-
     data_loader = DataLoader(
         dataset,
         num_workers=num_processes,
         batch_sampler=BatchSampler(
             node_counts, max_batch_nodes=max_batch_nodes, shuffle=False
         ),
-        collate_fn=collate_fn,
+        collate_fn=partial(_collate_subgraph_batch, cache_subgraph_dir=cache_subgraph_dir),
     )
 
     return data_loader, results

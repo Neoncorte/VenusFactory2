@@ -6,8 +6,6 @@ _REPO_ROOT = next((p for p in Path(__file__).absolute().parents if (p / "src").i
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 import argparse
-import subprocess
-import json
 import torch
 import datetime
 import pandas as pd
@@ -15,103 +13,70 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 from src.tools.train.data.prosst.structure.get_sst_seq import SSTPredictor
 from src.tools.mutation.utils import generate_mutations_from_sequence
 from src.tools.mutation.models.esm.inverse_folding.util import extract_seq_from_pdb
+from src.tools.database.foldseek.foldseek_submit import submit_foldseek_job, wait_foldseek_complete
+from src.tools.database.foldseek.download_foldseek_m8 import download_foldseek_m8, FoldSeekAlignmentParser
 from typing import List, Dict
 from tqdm import tqdm
-from requests import get
-from time import sleep
 
 
 def process_pdb(pdb_file, output_dir):
     """
-    Submit PDB to Foldseek API and get structure alignments.
-    Returns the path to the generated FASTA file.
+    Submit PDB to the FoldSeek API and get structure alignments.
+    Returns the path to the generated FASTA file (or None if no alignments were found).
+
+    Uses the maintained FoldSeek client in src/tools/database/foldseek/ (submit + poll
+    + .m8 download), since the old ticket/result JSON endpoints this used previously
+    have since changed shape on the FoldSeek side.
     """
     file_name = pdb_file.split('.')[0].split('/')[-1]
     fasta_path = f'{output_dir}/{file_name}.fasta'
-    
+
     if os.path.exists(fasta_path):
         print(f'>>> {file_name} already exists')
         return fasta_path
-    
-    # Create output directory if it doesn't exist
+
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Submit a new job and get the ticket
-    repeat = True
-    try_times = 0
-    while repeat:
-        result = subprocess.run(
-            [
-                "curl", "-X", "POST", "-F", f"q=@{pdb_file}", 
-                "-F", "mode=3diaa", "-F", "database[]=afdb50", 
-                "-F", "database[]=afdb-proteome", "-F", "database[]=cath50", 
-                "-F", "database[]=mgnify_esm30", "-F", "database[]=pdb100", 
-                "-F", "database[]=gmgcl_id", "-F", "database[]=afdb-swissprot", 
-                "-F", "database[]=bfvd", "-F", "database[]=bfmd", 
-                "https://search.foldseek.com/api/ticket"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        try:
-            result = result.stdout
-            ticket = json.loads(result)
-            repeat = ticket['status'] != 'COMPLETE'
-        except:
-            sleep(1)
-            try_times += 1
-            print('>>> Try again for the ' + str(try_times) + ' time')
-            if try_times > 10:
-                print(f'>>> Failed to submit {file_name} after {try_times} attempts')
-                return None
-            continue
-    
-    print('>>> Ticket:', ticket)
-    result = get('https://search.foldseek.com/api/result/' + ticket['id'] + '/0').json()
-    structure_aln_dict = result
-    results = structure_aln_dict['results']
-    query_seq = structure_aln_dict['queries'][0]['sequence']
-    
+
+    print('>>> Submitting to FoldSeek...')
+    job_id = submit_foldseek_job(pdb_file)
+    print(f'>>> Job submitted: {job_id}, waiting for completion...')
+    wait_foldseek_complete(job_id)
+
+    print('>>> Downloading alignments...')
+    m8_dir = os.path.join(output_dir, f'{file_name}_m8')
+    m8_files = download_foldseek_m8(job_id, m8_dir)
+
     alignment_dict = {}
-    for result_db in results:
-        if len(result_db['alignments']) == 0:
-            continue
-        for target_info in result_db['alignments'][0]:
-            name = f"{target_info['target']}/prob_{target_info['prob']}/eval_{target_info['eval']}/score_{target_info['score']}/{target_info['qStartPos']}-{target_info['qEndPos']}"
-            qaln = target_info['qAln']
-            dbaln = target_info['dbAln']
-            try:
-                # Get the index list of '-' in qaln
-                qaln = list(qaln)
-                miss_index = [i for i in range(len(qaln)) if qaln[i] == '-']
-                # Remove the residues in dbaln according to the missing index list in qaln
-                dbaln = list(dbaln)
-                dbaln = ''.join([dbaln[i] for i in range(len(dbaln)) if i not in miss_index])
-            except Exception as e:
-                print(e)
-                print(name)
-            # Fill '-' to the left and right of dbaln to make it the same length as query_seq
-            left = target_info['qStartPos'] - 1
-            right = len(query_seq) - target_info['qEndPos']
+    seqs = []
+    for m8_file in m8_files:
+        db_name = os.path.basename(m8_file)[len('alis_'):-len('.m8')]
+        for alignment in FoldSeekAlignmentParser(m8_file).parse():
+            name = f"{db_name}/{alignment.tseqid.split(' ')[0]}/prob_{alignment.prob}/eval_{alignment.evalue}/{alignment.qstart}-{alignment.qend}"
+            # Drop target residues that align to query gap columns, so dbaln lines
+            # up one-to-one with query positions
+            qaln = list(alignment.qaln)
+            miss_index = [i for i in range(len(qaln)) if qaln[i] == '-']
+            taln = list(alignment.taln)
+            dbaln = ''.join([taln[i] for i in range(len(taln)) if i not in miss_index])
+            # Pad with '-' to the left/right to make it the same length as the full query
+            left = alignment.qstart - 1
+            right = alignment.qlen - alignment.qend
             dbaln = '-' * left + dbaln + '-' * right
+            if dbaln in seqs:
+                continue
+            seqs.append(dbaln)
             alignment_dict[name] = dbaln
-    
-    if alignment_dict == {}:
+
+    if not alignment_dict:
         print(f'>>> {file_name} has no alignment')
         with open(fasta_path, 'w') as f:
             f.write('\n')
         return None
-    
-    seqs = []
+
     with open(fasta_path, 'w') as f:
         for key, value in alignment_dict.items():
-            if value not in seqs:
-                seqs.append(value)
-            else:
-                continue
             f.write(f'>{key}\n{value}\n')
-    
+
     print(f'>>> {file_name} done, saved {len(seqs)} unique alignments')
     return fasta_path
 
