@@ -25,38 +25,43 @@ def download_foldseek_m8(
     output_dir = Path(output_dir)
     databases = databases or DEFAULT_DATABASES
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # FoldSeek's download endpoint ignores the `db` query param and always returns one
+    # archive containing the .m8 results for every database that was searched, so a
+    # single request is enough. (Looping per db here previously re-downloaded the exact
+    # same archive for each database and kept only its first .m8 member every time,
+    # silently writing identical alignment data under every database's filename.)
+    download_url = f"{FOLDSEEK_API_URL}/result/download/{job_id}"
+    download_response = requests.get(download_url, params={"type": "aln"})
+    if download_response.status_code != 200:
+        return []
+
     downloaded_files = []
-
-    for db in databases:
-        params = {"type": "aln", "db": db}
-        download_url = f"{FOLDSEEK_API_URL}/result/download/{job_id}"
-        download_response = requests.get(download_url, params=params)
-
-        if download_response.status_code != 200:
-            continue
-
+    try:
+        with tarfile.open(fileobj=io.BytesIO(download_response.content), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                if not member.name.endswith(".m8") or "_report" in member.name:
+                    continue
+                db_name = member.name[len("alis_"):-len(".m8")]
+                if db_name not in databases:
+                    continue
+                file_content = tar.extractfile(member).read()
+                output_m8_path = output_dir / member.name
+                with open(output_m8_path, "wb") as f:
+                    f.write(file_content)
+                downloaded_files.append(str(output_m8_path))
+    except tarfile.ReadError:
         try:
-            with tarfile.open(fileobj=io.BytesIO(download_response.content), mode="r:gz") as tar:
-                for member in tar.getmembers():
-                    if member.name.endswith(".m8") and "_report" not in member.name:
-                        file_content = tar.extractfile(member).read()
-                        output_m8_path = output_dir / f"alis_{db}.m8"
-                        with open(output_m8_path, "wb") as f:
-                            f.write(file_content)
-                        downloaded_files.append(str(output_m8_path))
-                        break
-        except tarfile.ReadError:
-            try:
-                decompressed_content = gzip.decompress(download_response.content)
-                output_m8_path = output_dir / f"alis_{db}.m8"
-                with open(output_m8_path, "wb") as f:
-                    f.write(decompressed_content)
-                downloaded_files.append(str(output_m8_path))
-            except gzip.BadGzipFile:
-                output_m8_path = output_dir / f"alis_{db}.m8"
-                with open(output_m8_path, "wb") as f:
-                    f.write(download_response.content)
-                downloaded_files.append(str(output_m8_path))
+            decompressed_content = gzip.decompress(download_response.content)
+            output_m8_path = output_dir / f"{job_id}.m8"
+            with open(output_m8_path, "wb") as f:
+                f.write(decompressed_content)
+            downloaded_files.append(str(output_m8_path))
+        except gzip.BadGzipFile:
+            output_m8_path = output_dir / f"{job_id}.m8"
+            with open(output_m8_path, "wb") as f:
+                f.write(download_response.content)
+            downloaded_files.append(str(output_m8_path))
 
     return downloaded_files
 
